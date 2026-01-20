@@ -17,19 +17,23 @@
  */
 package org.wso2.asgardeo.client;
 
+import feign.FeignException;
+import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.jetbrains.annotations.NotNull;
 import org.wso2.asgardeo.client.model.*;
 import org.wso2.carbon.apimgt.api.APIManagementException;
 import org.wso2.carbon.apimgt.api.model.*;
 import org.wso2.carbon.apimgt.impl.APIConstants;
 import org.wso2.carbon.apimgt.impl.AbstractKeyManager;
-import org.wso2.carbon.apimgt.impl.dao.ApiMgtDAO;
 import org.wso2.carbon.apimgt.impl.kmclient.FormEncoder;
 import org.wso2.asgardeo.client.model.AsgardeoAccessTokenResponse;
+import org.wso2.carbon.apimgt.impl.kmclient.KeyManagerClientException;
 
 import java.io.UnsupportedEncodingException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * This class provides the implementation to use "Custom" Authorization Server for managing
@@ -38,8 +42,17 @@ import java.util.*;
 public class AsgardeoOAuthClient extends AbstractKeyManager {
 
     private static final Log log = LogFactory.getLog(AsgardeoOAuthClient.class);
+
     private AsgardeoTokenClient tokenClient;
     private AsgardeoDCRClient dcrClient;
+    private AsgardeoAppListClient appListClient;
+    private AsgardeoOIDCInboundClient oidcInboundClient;
+    private AsgardeoIntrospectionClient introspectionClient;
+    private Map<String, String> appIdMap;
+
+    private String mgmtClientId, mgmtClientSecret; //client id and secret of app management api authorized
+
+    private boolean issueJWTTokens;
 
     /**
      * {@code APIManagerComponent} calls this method, passing KeyManagerConfiguration as a {@code String}.
@@ -52,13 +65,17 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
 
         this.configuration = keyManagerConfiguration;
 
+        appIdMap = new ConcurrentHashMap<>(); //map for app id
         String org = (String) configuration.getParameter(AsgardeoConstants.ORG_NAME);
         // COME BACK base url is hardcoded
         String baseURL = "https://api.asgardeo.io";
 
-        String clientId = (String) configuration.getParameter(AsgardeoConstants.MGMT_CLIENT_ID);
-        String clientSecret = (String) configuration.getParameter(AsgardeoConstants.MGMT_CLIENT_SECRET);
+        mgmtClientId = (String) configuration.getParameter(AsgardeoConstants.MGMT_CLIENT_ID);
+        mgmtClientSecret = (String) configuration.getParameter(AsgardeoConstants.MGMT_CLIENT_SECRET);
 
+        if(configuration.getParameter(AsgardeoConstants.ACCESS_TOKEN_TYPE) != null)
+            issueJWTTokens = (boolean) configuration.getParameter(AsgardeoConstants.ACCESS_TOKEN_TYPE);
+        else issueJWTTokens = false; //default to opaque
         String dcrEndpoint;
         if(configuration.getParameter(APIConstants.KeyManager.CLIENT_REGISTRATION_ENDPOINT) != null)
             dcrEndpoint = (String) configuration.getParameter(APIConstants.KeyManager.CLIENT_REGISTRATION_ENDPOINT);
@@ -71,15 +88,31 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         else
             tokenEndpoint = baseURL + "/t/" + org + "/oauth2/token";
 
+        String introspectionEndpoint;
+        if(configuration.getParameter(APIConstants.KeyManager.INTROSPECTION_ENDPOINT) != null)
+            introspectionEndpoint = (String) configuration.getParameter(APIConstants.KeyManager.INTROSPECTION_ENDPOINT);
+        else
+            introspectionEndpoint = baseURL + "/t/" + org + "/oauth2/introspect";
+
+        // for JWT conversion - Application management API endpoint
+        String applicationsServerBase = baseURL + "/t/" + org + "/api/server/v1";
 
         tokenClient = feign.Feign.builder()
                 .client(new feign.okhttp.OkHttpClient())
                 .encoder(new FormEncoder())
                 .decoder(new feign.gson.GsonDecoder())
                 .logger(new feign.slf4j.Slf4jLogger())
-                .target(org.wso2.asgardeo.client.model.AsgardeoTokenClient.class, tokenEndpoint);
+                .target(AsgardeoTokenClient.class, tokenEndpoint);
 
-        AsgardeoDCRAuthInterceptor interceptor = new AsgardeoDCRAuthInterceptor(tokenClient, clientId, clientSecret);
+        introspectionClient = feign.Feign.builder()
+                .client(new feign.okhttp.OkHttpClient())
+                .encoder(new FormEncoder())
+                .decoder(new feign.gson.GsonDecoder())
+                .logger(new feign.slf4j.Slf4jLogger())
+                .target(AsgardeoIntrospectionClient.class, introspectionEndpoint);
+
+
+        AsgardeoDCRAuthInterceptor interceptor = new AsgardeoDCRAuthInterceptor(tokenClient, mgmtClientId, mgmtClientSecret);
 
         dcrClient = feign.Feign.builder()
                 .client(new feign.okhttp.OkHttpClient())
@@ -88,6 +121,24 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
                 .logger(new feign.slf4j.Slf4jLogger())
                 .requestInterceptor(interceptor)
                 .target(AsgardeoDCRClient.class, dcrEndpoint);
+
+        appListClient = feign.Feign.builder()
+                .client(new feign.okhttp.OkHttpClient())
+                .encoder(new feign.gson.GsonEncoder())
+                .decoder(new feign.gson.GsonDecoder())
+                .logger(new feign.slf4j.Slf4jLogger())
+                .requestInterceptor(interceptor)
+                .target(AsgardeoAppListClient.class, applicationsServerBase);
+
+        oidcInboundClient = feign.Feign.builder()
+                .client(new feign.okhttp.OkHttpClient())
+                .encoder(new feign.gson.GsonEncoder())
+                .decoder(new feign.gson.GsonDecoder())
+                .logger(new feign.slf4j.Slf4jLogger())
+                .requestInterceptor(interceptor)
+                .target(AsgardeoOIDCInboundClient.class, applicationsServerBase);
+
+
     }
 
     /**
@@ -101,7 +152,6 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
 
         OAuthApplicationInfo in = oAuthAppRequest.getOAuthApplicationInfo();
 
-
         String appName = in.getClientName();
         String keyType = (String) in.getParameter(ApplicationConstants.APP_KEY_TYPE);
         String user = (String) in.getParameter(ApplicationConstants.OAUTH_CLIENT_USERNAME);
@@ -112,29 +162,121 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
 
         body.setClientName(clientName);
 
-        // COME BACK hardcoded grant types (client_credentials)
+        List<String> grantTypes = getGrantTypesFromOAuthApp(in);
+        body.setGrantTypes(grantTypes);
+      //  log.info("APIM Callback uRL : "+in.getCallBackURL());
+        body.setRedirectUris(java.util.Collections.singletonList("https://localhost:9443"));
+
+        try {
+            AsgardeoDCRClientInfo created = dcrClient.create(body);
+
+            if (issueJWTTokens)
+                tryChangeAccessTokenToJWT(created, oAuthAppRequest);
+
+            return createOAuthApplicationInfo(created);
+        } catch (KeyManagerClientException e) {
+           handleException("Cannot create OAuth Application: "+clientName+ " for Application "+appName, e);
+           return null;
+        }
+    }
+
+    private void tryChangeAccessTokenToJWT(AsgardeoDCRClientInfo created, OAuthAppRequest oAuthAppRequest) throws APIManagementException {
+        try{
+            String appId = resolveAppIdByClientId(created.getClientId());
+
+            AsgardeoOIDCInboundRequest inboundRequest = buildInboundPayload(created, oAuthAppRequest);
+
+            try {
+                oidcInboundClient.updateOidcInbound(appId, inboundRequest);
+            }catch(feign.FeignException e){
+                log.warn("Failed to update OIDC config to JWT for client ID : "+created.getClientId()
+                + " (app ID : "+appId+"). Falling back to Opaque type. HTTP "+e.status() +" body=" +e.contentUTF8());
+            }
+
+            created.setId(appId);
+        }catch(APIManagementException e){
+            handleException("Could not change access token of service provider with ID : "+created.getClientId(), e);
+        }
+    }
+
+    private AsgardeoOIDCInboundRequest buildInboundPayload(AsgardeoDCRClientInfo created, OAuthAppRequest oAuthAppRequest) {
+        AsgardeoOIDCInboundRequest toBeBuilt = new AsgardeoOIDCInboundRequest();
+
+        toBeBuilt.setClientId(created.getClientId());
+        toBeBuilt.setGrantTypes(created.getGrantTypes());
+        toBeBuilt.setAllowedOrigins(Collections.emptyList());
+
+        AsgardeoOIDCInboundRequest.AccessToken accessToken = new AsgardeoOIDCInboundRequest.AccessToken("JWT", 3600, 3600);
+
+        toBeBuilt.setAccessToken(accessToken);
+        return toBeBuilt;
+    }
+
+    // this method also provides fast lookup if the app id exists
+    private String resolveAppIdByClientId(String clientId) throws APIManagementException{
+        int limit = 300;
+        int offset = 0;
+
+        String appId = appIdMap.get(clientId); //first go through the map to see if it exists
+
+        if(appId != null)
+            return appId;
+
+        // will loop through the results 300 at a time to be safe
+        while(true){
+            AsgardeoApplicationsResponse page = appListClient.list(limit, "clientId", offset);
+
+            if (page.getApplications() != null){
+                for(AsgardeoApplicationsResponse.App app : page.getApplications()){
+
+                    String retrievedClientId = app.getClientId();
+                    appIdMap.put(retrievedClientId, app.getId());
+
+                    if(clientId.equals(retrievedClientId)){
+                        return app.getId();
+                    }
+                }
+            }
+
+            int returnedResultsCount = page.getCount();
+            if(returnedResultsCount <= 0) break;
+
+            offset += returnedResultsCount;
+        }
+
+        throw new APIManagementException("Could not find Asgardeo Application ID for Client ID : "+clientId);
+    }
+
+    @NotNull
+    private static List<String> getGrantTypesFromOAuthApp(OAuthApplicationInfo in) {
         List<String> grantTypes = new ArrayList<>();
         if (in.getParameter(APIConstants.JSON_GRANT_TYPES) != null) {
             grantTypes = Arrays.asList(((String) in.getParameter(APIConstants.JSON_GRANT_TYPES))
                     .split(","));
         }
-        body.setGrantTypes(grantTypes);
+        return grantTypes;
+    }
 
-        body.setRedirectUris(java.util.Collections.singletonList("https://localhost"));
-
-        AsgardeoDCRClientInfo created = dcrClient.create(body);
-
+    @NotNull
+    private static OAuthApplicationInfo createOAuthApplicationInfo(AsgardeoDCRClientInfo dcrClient) {
         OAuthApplicationInfo out = new OAuthApplicationInfo();
-        out.setClientName(clientName);
-        out.setClientId(created.getClientId());
-        out.setClientSecret(created.getClientSecret());
-        out.addParameter(ApplicationConstants.OAUTH_CLIENT_ID, created.getClientId());
-        out.addParameter(ApplicationConstants.OAUTH_CLIENT_SECRET, created.getClientSecret());
+        out.setClientName(dcrClient.getClientName());
+        out.setClientId(dcrClient.getClientId());
+        out.setClientSecret(dcrClient.getClientSecret());
+        out.addParameter(ApplicationConstants.OAUTH_CLIENT_ID, dcrClient.getClientId());
+        out.addParameter(ApplicationConstants.OAUTH_CLIENT_SECRET, dcrClient.getClientSecret());
 
-        if (created.getGrantTypes() != null && created.getGrantTypes().size() > 0) {
-            out.addParameter(APIConstants.JSON_GRANT_TYPES, String.join(" ", created.getGrantTypes()));
+        if (dcrClient.getGrantTypes() != null && dcrClient.getGrantTypes().size() > 0) {
+            out.addParameter(APIConstants.JSON_GRANT_TYPES, String.join(" ", dcrClient.getGrantTypes()));
         }
 
+        if(dcrClient.getRedirectUris() != null && !dcrClient.getRedirectUris().isEmpty()){
+            out.setCallBackURL(String.join(",", dcrClient.getRedirectUris()));
+        }
+
+        //put app id in OAuthApplicationInfo if needed later
+        if(dcrClient.getId() != null)
+            out.addParameter(APIConstants.JSON_ADDITIONAL_PROPERTIES, new HashMap<>().put("asgardeoAppId", dcrClient.getId()));
         return out;
     }
 
@@ -149,9 +291,32 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     @Override
     public OAuthApplicationInfo updateApplication(OAuthAppRequest oAuthAppRequest) throws APIManagementException {
 
-        //todo update oauth app in the authorization server
+        OAuthApplicationInfo in = oAuthAppRequest.getOAuthApplicationInfo();
 
-        return null;
+        AsgardeoDCRClientInfo body = new AsgardeoDCRClientInfo();
+
+        body.setGrantTypes(getGrantTypesFromOAuthApp(in));
+
+        if(in.getCallBackURL() != null && !StringUtils.isBlank(in.getCallBackURL())){
+            body.setRedirectUris(Arrays.asList(in.getCallBackURL().split(",")));
+        }
+
+        try {
+            AsgardeoDCRClientInfo updated = dcrClient.update(in.getClientId(), body);
+
+//            try {
+//                String appId = resolveAppIdByClientId(in.getClientId());
+//                updated.setId(appId);
+//            }catch (APIManagementException e){
+//                System.out.println("Couldn't find app Id");
+//            }
+
+            return createOAuthApplicationInfo(updated);
+        } catch (KeyManagerClientException e) {
+            handleException("Could not update service provider with ID: "+in.getClientId(), e);
+            return null;
+        }
+
     }
 
     @Override
@@ -169,9 +334,11 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
      */
     @Override
     public void deleteApplication(String clientId) throws APIManagementException {
-
-        //todo delete oauth app in the authorization server
-
+        try {
+            dcrClient.delete(clientId);
+        } catch (KeyManagerClientException e) {
+            handleException("Cannot remove service provider for the given ID : " + clientId, e);
+        }
     }
 
     /**
@@ -184,8 +351,25 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     @Override
     public OAuthApplicationInfo retrieveApplication(String clientId) throws APIManagementException {
 
-        //todo retrieve oauth app in the authorization server
-        return null;
+        try {
+            AsgardeoDCRClientInfo retrieved = dcrClient.get(clientId);
+
+            if(retrieved == null)
+                return null;
+
+//            try {
+//                String appId = resolveAppIdByClientId(clientId);
+//                retrieved.setId(appId);
+//            }catch (APIManagementException e){
+//                System.out.println("Couldn't find app Id");
+//            }
+
+            return createOAuthApplicationInfo(retrieved);
+        } catch (KeyManagerClientException e) {
+            handleException("Cannot retrieve service provider for the given ID : "+clientId, e);
+            return null;
+        }
+
     }
 
     /**
@@ -225,38 +409,13 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         response.setConsumerSecret(clientSecret);
         response.setAccessToken(retrievedToken.getAccessToken());
         response.setValidityPeriod(retrievedToken.getExpiry());
+        response.setKeyManager(getType());
 
-        if (retrievedToken.getScope() != null && !retrievedToken.getScope().isBlank()) {
+        if (retrievedToken.getScope() != null && !StringUtils.isBlank(retrievedToken.getScope())) {
             response.setScope(retrievedToken.getScope().trim().split("\\s+"));
         }
         return response;
     }
-
-    /**
-     * This is used to build accesstoken request from OAuth application info.
-     *
-     * @param oAuthApplication OAuth application details.
-     * @param tokenRequest     AccessTokenRequest that is need to be updated with addtional info.
-     * @return AccessTokenRequest after adding OAuth application details.
-     * @throws APIManagementException This is the custom exception class for API management.
-     */
-    @Override
-    public AccessTokenRequest buildAccessTokenRequestFromOAuthApp(
-            OAuthApplicationInfo oAuthApplication, AccessTokenRequest tokenRequest) throws APIManagementException {
-
-        log.debug("Invoking buildAccessTokenRequestFromOAuthApp() method..");
-        if (oAuthApplication == null) {
-            return tokenRequest;
-        }
-        if (tokenRequest == null) {
-            tokenRequest = new AccessTokenRequest();
-        }
-       // todo implement logic to build an access token request
-
-        return tokenRequest;
-    }
-
-
 
     /**
      * This is used to get the meta data of the accesstoken.
@@ -272,9 +431,68 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
             log.debug(String.format("Getting access token metadata from authorization server. Access token %s",
                     accessToken));
         }
+
         AccessTokenInfo tokenInfo = new AccessTokenInfo();
-// todo implemnt logic to get access token meta data from the introspect endpoint
+
+        tokenInfo.setAccessToken(accessToken);
+        tokenInfo.setKeyManager(getType());
+        tokenInfo.setTokenState("UNKNOWN"); //default value changes later
+
+        String basicCredentials = getEncodedCredentials(mgmtClientId, mgmtClientSecret);
+
+        AsgardeoIntrospectionResponse response;
+
+        try {
+            response = introspectionClient.introspect(accessToken, basicCredentials);
+        } catch (KeyManagerClientException e) {
+            throw new APIManagementException("Error occurred in token introspection!", e);
+        } catch(FeignException e){
+
+            tokenInfo.setTokenValid(false);
+            tokenInfo.setTokenState(AsgardeoConstants.TOKEN_STATE_INTROSPECTION_FAILED);
+            tokenInfo.setErrorcode(APIConstants.KeyValidationStatus.API_AUTH_GENERAL_ERROR);
+            tokenInfo.addParameter("httpStatus", e.status());
+            tokenInfo.addParameter("errorBody", e.contentUTF8());
+            handleException("Introspection Failed!", e);
             return tokenInfo;
+        }
+
+        if(response == null || !response.isActive()){
+            tokenInfo.setTokenValid(false);
+            tokenInfo.setTokenState(AsgardeoConstants.TOKEN_STATE_INACTIVE);
+            tokenInfo.setErrorcode(APIConstants.KeyValidationStatus.API_AUTH_INVALID_CREDENTIALS);
+            return tokenInfo;
+        }
+
+        //token is active if hits here
+        tokenInfo.setTokenValid(true);
+        tokenInfo.setTokenState(AsgardeoConstants.TOKEN_STATE_ACTIVE);
+        tokenInfo.setApplicationToken(AsgardeoConstants.TOKEN_APPLICATION.equalsIgnoreCase(response.getAut()));
+
+        if(response.getClientId() != null)
+            tokenInfo.setConsumerKey(response.getClientId());
+
+        if(response.getScope() != null && !StringUtils.isBlank(response.getScope()))
+            tokenInfo.setScope(response.getScope().trim().split("\\s+"));
+        else
+            tokenInfo.setScope(new String[0]);
+
+        if(response.getIat() != null) //issued at
+            tokenInfo.setIssuedTime(response.getIat() * 1000L);
+
+        if(response.getExp() != null){ //expiry
+            long validityMillis = Math.max(0, response.getExp()*1000L - System.currentTimeMillis());
+            tokenInfo.setValidityPeriod(validityMillis);
+            tokenInfo.addParameter("exp", response.getExp()*1000L); //keeping it in parameters optionally
+        }
+
+        tokenInfo.addParameter("token_type", response.getTokenType());
+        if (response.getIss() != null) tokenInfo.addParameter("iss", response.getIss());
+        if (response.getAud() != null) tokenInfo.addParameter("aud", response.getAud());
+        if (response.getSub() != null) tokenInfo.addParameter("sub", response.getSub());
+        if (response.getJti() != null) tokenInfo.addParameter("jti", response.getJti());
+
+        return tokenInfo;
     }
 
     @Override
@@ -299,7 +517,14 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     @Override
     public OAuthApplicationInfo mapOAuthApplication(OAuthAppRequest oAuthAppRequest) throws APIManagementException {
 
-        return oAuthAppRequest.getOAuthApplicationInfo();
+        OAuthApplicationInfo toMap = oAuthAppRequest.getOAuthApplicationInfo();
+        String clientId = toMap.getClientId();
+        String clientSecret = toMap.getClientSecret();
+        OAuthApplicationInfo retrieved = retrieveApplication(clientId);
+
+        if (!retrieved.getClientSecret().equals(clientSecret))
+            throw new APIManagementException("Error when mapping.");
+        return retrieved;
     }
 
     @Override
@@ -353,19 +578,20 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     @Override
     public Map<String, Set<Scope>> getScopesForAPIS(String apiIdsString) throws APIManagementException {
 
-        Map<String, Set<Scope>> apiToScopeMapping = new HashMap<>();
-        ApiMgtDAO apiMgtDAO = ApiMgtDAO.getInstance();
-        Map<String, Set<String>> apiToScopeKeyMapping = apiMgtDAO.getScopesForAPIS(apiIdsString);
-        for (String apiId : apiToScopeKeyMapping.keySet()) {
-            Set<Scope> apiScopes = new LinkedHashSet<>();
-            Set<String> scopeKeys = apiToScopeKeyMapping.get(apiId);
-            for (String scopeKey : scopeKeys) {
-                Scope scope = getScopeByName(scopeKey);
-                apiScopes.add(scope);
-            }
-            apiToScopeMapping.put(apiId, apiScopes);
-        }
-        return apiToScopeMapping;
+//        Map<String, Set<Scope>> apiToScopeMapping = new HashMap<>();
+//        ApiMgtDAO apiMgtDAO = ApiMgtDAO.getInstance();
+//        Map<String, Set<String>> apiToScopeKeyMapping = apiMgtDAO.getScopesForAPIS(apiIdsString);
+//        for (String apiId : apiToScopeKeyMapping.keySet()) {
+//            Set<Scope> apiScopes = new LinkedHashSet<>();
+//            Set<String> scopeKeys = apiToScopeKeyMapping.get(apiId);
+//            for (String scopeKey : scopeKeys) {
+//                Scope scope = getScopeByName(scopeKey);
+//                apiScopes.add(scope);
+//            }
+//            apiToScopeMapping.put(apiId, apiScopes);
+//        }
+//        return apiToScopeMapping;
+        return null;
     }
 
     @Override
