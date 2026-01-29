@@ -17,6 +17,7 @@
  */
 package org.wso2.asgardeo.client;
 
+import com.google.gson.Gson;
 import feign.FeignException;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
@@ -24,6 +25,7 @@ import org.apache.commons.logging.LogFactory;
 import org.jetbrains.annotations.NotNull;
 import org.wso2.asgardeo.client.model.*;
 import org.wso2.carbon.apimgt.api.APIManagementException;
+import org.wso2.carbon.apimgt.api.ExceptionCodes;
 import org.wso2.carbon.apimgt.api.model.*;
 import org.wso2.carbon.apimgt.impl.APIConstants;
 import org.wso2.carbon.apimgt.impl.AbstractKeyManager;
@@ -46,11 +48,17 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     private AsgardeoTokenClient tokenClient;
     private AsgardeoDCRClient dcrClient;
     private AsgardeoAppListClient appListClient;
-    private AsgardeoOIDCInboundClient oidcInboundClient;
+   // private AsgardeoOIDCInboundClient oidcInboundClient;
     private AsgardeoIntrospectionClient introspectionClient;
+    private AsgardeoAPIResourceClient apiResourceClient;
+    private AsgardeoAPIResourceScopesClient apiResourceScopesClient;
+
     private Map<String, String> appIdMap;
+    private final Map<String, String> scopeNameToIdMap = new ConcurrentHashMap<>();
+
 
     private String mgmtClientId, mgmtClientSecret; //client id and secret of app management api authorized
+    private String globalApiResourceId;
 
     private boolean issueJWTTokens;
 
@@ -94,7 +102,7 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         else
             introspectionEndpoint = baseURL + "/t/" + org + "/oauth2/introspect";
 
-        // for JWT conversion - Application management API endpoint
+        // for JWT conversion - Application management API endpoint and API  resource endpoint
         String applicationsServerBase = baseURL + "/t/" + org + "/api/server/v1";
 
         tokenClient = feign.Feign.builder()
@@ -130,15 +138,33 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
                 .requestInterceptor(interceptor)
                 .target(AsgardeoAppListClient.class, applicationsServerBase);
 
-        oidcInboundClient = feign.Feign.builder()
+        // not needed as JWT token type can be set through a parameter in the DCR payload. but kept this in case we need
+        // to use this client in the future
+//        oidcInboundClient = feign.Feign.builder()
+//                .client(new feign.okhttp.OkHttpClient())
+//                .encoder(new feign.gson.GsonEncoder())
+//                .decoder(new feign.gson.GsonDecoder())
+//                .logger(new feign.slf4j.Slf4jLogger())
+//                .requestInterceptor(interceptor)
+//                .target(AsgardeoOIDCInboundClient.class, applicationsServerBase);
+
+        apiResourceClient = feign.Feign.builder()
                 .client(new feign.okhttp.OkHttpClient())
                 .encoder(new feign.gson.GsonEncoder())
                 .decoder(new feign.gson.GsonDecoder())
                 .logger(new feign.slf4j.Slf4jLogger())
                 .requestInterceptor(interceptor)
-                .target(AsgardeoOIDCInboundClient.class, applicationsServerBase);
+                .target(AsgardeoAPIResourceClient.class, applicationsServerBase);
 
+        apiResourceScopesClient = feign.Feign.builder()
+                .client(new feign.okhttp.OkHttpClient())
+                .encoder(new feign.gson.GsonEncoder())
+                .decoder(new feign.gson.GsonDecoder())
+                .logger(new feign.slf4j.Slf4jLogger())
+                .requestInterceptor(interceptor)
+                .target(AsgardeoAPIResourceScopesClient.class, applicationsServerBase);
 
+        globalApiResourceId = doesAPIResourceExistAndGetId();
     }
 
     /**
@@ -153,10 +179,11 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         OAuthApplicationInfo in = oAuthAppRequest.getOAuthApplicationInfo();
 
         String appName = in.getClientName();
+        String appId = in.getApplicationUUID();
         String keyType = (String) in.getParameter(ApplicationConstants.APP_KEY_TYPE);
         String user = (String) in.getParameter(ApplicationConstants.OAUTH_CLIENT_USERNAME);
 
-        String clientName = (user != null ? user : "apim") + "_" + appName + (keyType != null ? "_" + keyType : "");
+        String clientName = (user != null ? user : "apim") + "_" + appName + "_" + appId.substring(0, 7)+ (keyType != null ? "_" + keyType : "");
 
         AsgardeoDCRClientInfo body =  new AsgardeoDCRClientInfo();
 
@@ -165,13 +192,17 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         List<String> grantTypes = getGrantTypesFromOAuthApp(in);
         body.setGrantTypes(grantTypes);
       //  log.info("APIM Callback uRL : "+in.getCallBackURL());
+        // TODO this is still hardcoded
         body.setRedirectUris(java.util.Collections.singletonList("https://localhost:9443"));
 
         try {
-            AsgardeoDCRClientInfo created = dcrClient.create(body);
 
             if (issueJWTTokens)
-                tryChangeAccessTokenToJWT(created, oAuthAppRequest);
+                body.setTokenTypeAsJWT();
+
+            AsgardeoDCRClientInfo created = dcrClient.create(body);
+
+            authorizeAPItoApp(created);
 
             return createOAuthApplicationInfo(created);
         } catch (KeyManagerClientException e) {
@@ -180,37 +211,48 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         }
     }
 
-    private void tryChangeAccessTokenToJWT(AsgardeoDCRClientInfo created, OAuthAppRequest oAuthAppRequest) throws APIManagementException {
-        try{
-            String appId = resolveAppIdByClientId(created.getClientId());
+    private void authorizeAPItoApp(AsgardeoDCRClientInfo created) throws APIManagementException {
+        String appId = resolveAppIdByClientId(created.getClientId());
 
-            AsgardeoOIDCInboundRequest inboundRequest = buildInboundPayload(created, oAuthAppRequest);
-
-            try {
-                oidcInboundClient.updateOidcInbound(appId, inboundRequest);
-            }catch(feign.FeignException e){
-                log.warn("Failed to update OIDC config to JWT for client ID : "+created.getClientId()
-                + " (app ID : "+appId+"). Falling back to Opaque type. HTTP "+e.status() +" body=" +e.contentUTF8());
-            }
-
-            created.setId(appId);
-        }catch(APIManagementException e){
-            handleException("Could not change access token of service provider with ID : "+created.getClientId(), e);
+        try {
+            apiResourceClient.authorizeAPItoApp(appId, new AsgardeoAPIAuthRequest(globalApiResourceId));
+        }catch (FeignException e){
+            handleException("Couldn't Authorize Resource API to OAuth Application with Application Id: "+appId, e);
         }
     }
 
-    private AsgardeoOIDCInboundRequest buildInboundPayload(AsgardeoDCRClientInfo created, OAuthAppRequest oAuthAppRequest) {
-        AsgardeoOIDCInboundRequest toBeBuilt = new AsgardeoOIDCInboundRequest();
+    // no longer required as DCR call can do this
+//    private void tryChangeAccessTokenToJWT(AsgardeoDCRClientInfo created, OAuthAppRequest oAuthAppRequest) throws APIManagementException {
+//        try{
+//            String appId = resolveAppIdByClientId(created.getClientId());
+//
+//            AsgardeoOIDCInboundRequest inboundRequest = buildInboundPayload(created, oAuthAppRequest);
+//
+//            try {
+//                oidcInboundClient.updateOidcInbound(appId, inboundRequest);
+//            }catch(feign.FeignException e){
+//                log.warn("Failed to update OIDC config to JWT for client ID : "+created.getClientId()
+//                + " (app ID : "+appId+"). Falling back to Opaque type. HTTP "+e.status() +" body=" +e.contentUTF8());
+//            }
+//
+//            created.setId(appId);
+//        }catch(APIManagementException e){
+//            handleException("Could not change access token of service provider with ID : "+created.getClientId(), e);
+//        }
+//    }
 
-        toBeBuilt.setClientId(created.getClientId());
-        toBeBuilt.setGrantTypes(created.getGrantTypes());
-        toBeBuilt.setAllowedOrigins(Collections.emptyList());
-
-        AsgardeoOIDCInboundRequest.AccessToken accessToken = new AsgardeoOIDCInboundRequest.AccessToken("JWT", 3600, 3600);
-
-        toBeBuilt.setAccessToken(accessToken);
-        return toBeBuilt;
-    }
+//    private AsgardeoOIDCInboundRequest buildInboundPayload(AsgardeoDCRClientInfo created, OAuthAppRequest oAuthAppRequest) {
+//        AsgardeoOIDCInboundRequest toBeBuilt = new AsgardeoOIDCInboundRequest();
+//
+//        toBeBuilt.setClientId(created.getClientId());
+//        toBeBuilt.setGrantTypes(created.getGrantTypes());
+//        toBeBuilt.setAllowedOrigins(Collections.emptyList());
+//
+//        AsgardeoOIDCInboundRequest.AccessToken accessToken = new AsgardeoOIDCInboundRequest.AccessToken("JWT", 3600, 3600);
+//
+//        toBeBuilt.setAccessToken(accessToken);
+//        return toBeBuilt;
+//    }
 
     // this method also provides fast lookup if the app id exists
     private String resolveAppIdByClientId(String clientId) throws APIManagementException{
@@ -274,10 +316,28 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
             out.setCallBackURL(String.join(",", dcrClient.getRedirectUris()));
         }
 
-        //put app id in OAuthApplicationInfo if needed later
-        if(dcrClient.getId() != null)
-            out.addParameter(APIConstants.JSON_ADDITIONAL_PROPERTIES, new HashMap<>().put("asgardeoAppId", dcrClient.getId()));
+        Map<String, Object> additionalProperties = getAdditionalPropertiesFromClient(dcrClient);
+
+        out.addParameter(APIConstants.JSON_ADDITIONAL_PROPERTIES, additionalProperties);
+
         return out;
+    }
+
+    @NotNull
+    private static Map<String, Object> getAdditionalPropertiesFromClient(AsgardeoDCRClientInfo dcrClient) {
+        Map<String, Object> additionalProperties = new HashMap<>();
+        additionalProperties.put(AsgardeoConstants.APPLICATION_TOKEN_LIFETIME,
+                dcrClient.getApplicationTokenLifetime());
+        additionalProperties.put(AsgardeoConstants.USER_TOKEN_LIFETIME,
+                dcrClient.getUserTokenLifetime());
+        additionalProperties.put(AsgardeoConstants.REFRESH_TOKEN_LIFETIME,
+                dcrClient.getRefreshTokenLifetime());
+        additionalProperties.put(AsgardeoConstants.ID_TOKEN_LIFETIME, dcrClient.getIdTokenLifetime());
+
+        //put app id in if needed later
+        if(dcrClient.getId() != null)
+            additionalProperties.put("asgardeoAppId", dcrClient.getId());
+        return additionalProperties;
     }
 
     /**
@@ -301,6 +361,15 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
             body.setRedirectUris(Arrays.asList(in.getCallBackURL().split(",")));
         }
 
+        Object parameter = in.getParameter(APIConstants.JSON_ADDITIONAL_PROPERTIES);
+
+        Map<String, Object> additionalProperties = new HashMap<>();
+
+        if (parameter instanceof String) {
+            additionalProperties = new Gson().fromJson((String) parameter, Map.class);
+            setAdditionalPropertiesToClient(additionalProperties, in, body);
+        }
+
         try {
             AsgardeoDCRClientInfo updated = dcrClient.update(in.getClientId(), body);
 
@@ -317,6 +386,84 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
             return null;
         }
 
+    }
+
+    private static void setAdditionalPropertiesToClient(Map<String, Object> additionalProperties, OAuthApplicationInfo in, AsgardeoDCRClientInfo body) throws APIManagementException {
+        if (additionalProperties.containsKey(AsgardeoConstants.APPLICATION_TOKEN_LIFETIME)) {
+            Object expiryTimeObject =
+                    additionalProperties.get(AsgardeoConstants.APPLICATION_TOKEN_LIFETIME);
+            if (expiryTimeObject instanceof String) {
+                if (!APIConstants.KeyManager.NOT_APPLICABLE_VALUE.equals(expiryTimeObject)) {
+                    try {
+                        long expiry = Long.parseLong((String) expiryTimeObject);
+                        if (expiry < 0) {
+                            throw new APIManagementException("Invalid application token lifetime given for "
+                                    + in.getClientName(), ExceptionCodes.INVALID_APPLICATION_PROPERTIES);
+                        }
+                        body.setApplicationTokenLifetime(expiry);
+                    } catch (NumberFormatException e) {
+                        // No need to throw as its due to not a number sent.
+                    }
+                }
+            }
+        }
+
+        if (additionalProperties.containsKey(AsgardeoConstants.USER_TOKEN_LIFETIME)) {
+            Object expiryTimeObject =
+                    additionalProperties.get(AsgardeoConstants.USER_TOKEN_LIFETIME);
+            if (expiryTimeObject instanceof String) {
+                if (!APIConstants.KeyManager.NOT_APPLICABLE_VALUE.equals(expiryTimeObject)) {
+                    try {
+                        long expiry = Long.parseLong((String) expiryTimeObject);
+                        if (expiry < 0) {
+                            throw new APIManagementException("Invalid application token lifetime given for "
+                                    + in.getClientName(), ExceptionCodes.INVALID_APPLICATION_PROPERTIES);
+                        }
+                        body.setUserTokenLifetime(expiry);
+                    } catch (NumberFormatException e) {
+                        // No need to throw as its due to not a number sent.
+                    }
+                }
+            }
+        }
+
+        if (additionalProperties.containsKey(AsgardeoConstants.REFRESH_TOKEN_LIFETIME)) {
+            Object expiryTimeObject =
+                    additionalProperties.get(AsgardeoConstants.REFRESH_TOKEN_LIFETIME);
+            if (expiryTimeObject instanceof String) {
+                if (!APIConstants.KeyManager.NOT_APPLICABLE_VALUE.equals(expiryTimeObject)) {
+                    try {
+                        long expiry = Long.parseLong((String) expiryTimeObject);
+                        if (expiry < 0) {
+                            throw new APIManagementException("Invalid application token lifetime given for "
+                                    + in.getClientName(), ExceptionCodes.INVALID_APPLICATION_PROPERTIES);
+                        }
+                        body.setRefreshTokenLifetime(expiry);
+                    } catch (NumberFormatException e) {
+                        // No need to throw as its due to not a number sent.
+                    }
+                }
+            }
+        }
+
+        if (additionalProperties.containsKey(AsgardeoConstants.ID_TOKEN_LIFETIME)) {
+            Object expiryTimeObject =
+                    additionalProperties.get(AsgardeoConstants.ID_TOKEN_LIFETIME);
+            if (expiryTimeObject instanceof String) {
+                if (!APIConstants.KeyManager.NOT_APPLICABLE_VALUE.equals(expiryTimeObject)) {
+                    try {
+                        long expiry = Long.parseLong((String) expiryTimeObject);
+                        if (expiry < 0) {
+                            throw new APIManagementException("Invalid application token lifetime given for "
+                                    + in.getClientName(), ExceptionCodes.INVALID_APPLICATION_PROPERTIES);
+                        }
+                        body.setIdTokenLifetime(expiry);
+                    } catch (NumberFormatException e) {
+                        // No need to throw as its due to not a number sent.
+                    }
+                }
+            }
+        }
     }
 
     @Override
@@ -401,7 +548,7 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         AsgardeoAccessTokenResponse retrievedToken = tokenClient.getAccessToken(grantType, scope, basicCredentials);
 
         if(retrievedToken == null || retrievedToken.getAccessToken() == null || retrievedToken.getAccessToken().isEmpty())
-            throw new APIManagementException("Asgardeoeo token endpoint returned an empty token!");
+            throw new APIManagementException("Asgardeo token endpoint returned an empty token!");
 
         // mapping response to apim  model
         AccessTokenInfo response = new AccessTokenInfo();
@@ -596,19 +743,40 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
 
     @Override
     public void registerScope(Scope scope) throws APIManagementException {
+        AsgardeoScopeCreateRequest req = new AsgardeoScopeCreateRequest();
+        req.setName((scope.getKey()));
+        req.setDisplayName(scope.getName());
+        req.setDescription(scope.getDescription());
 
+        AsgardeoScopeResponse created = apiResourceScopesClient.createScope(globalApiResourceId, Collections.singletonList(req));
+        if (created != null && created.getId() != null) {
+            scopeNameToIdMap.put(created.getName(), created.getId());
+        }
     }
 
     @Override
     public Scope getScopeByName(String name) throws APIManagementException {
 
-        return null;
+        return getAllScopes().get(name);
     }
 
     @Override
     public Map<String, Scope> getAllScopes() throws APIManagementException {
+        Map<String, Scope> map = new HashMap<>();
 
-        return null;
+        List<AsgardeoScopeResponse> scopes =  apiResourceScopesClient.listScopes(globalApiResourceId);
+
+        for (AsgardeoScopeResponse s : scopes) {
+            scopeNameToIdMap.put((s.getName()), s.getId());
+
+            Scope scope = new Scope();
+            scope.setKey((s.getName()));
+            scope.setName(s.getDisplayName());
+            scope.setDescription(s.getDescription());
+            map.put(scope.getKey(), scope);
+        }
+
+        return map;
     }
 
     @Override
@@ -620,8 +788,44 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     public void updateResourceScopes(API api, Set<String> oldLocalScopeKeys, Set<Scope> newLocalScopes,
                                      Set<URITemplate> oldURITemplates, Set<URITemplate> newURITemplates)
             throws APIManagementException {
+        //delete old local scopes from Asgardeo (optional: only those prefixed as local)
+        for (String oldScope : oldLocalScopeKeys) {
+            deleteScope((oldScope));
+        }
 
+        List<AsgardeoScopeResponse> fetchedScopes = apiResourceScopesClient.listScopes(globalApiResourceId);
+
+        ArrayList<AsgardeoScopeCreateRequest> scopesToBeUpdated = new ArrayList<>(newLocalScopes.size() + fetchedScopes.size());
+
+        //create or update new scopes
+        for (Scope scope : newLocalScopes) {
+            AsgardeoScopeCreateRequest req = new AsgardeoScopeCreateRequest();
+            req.setName((scope.getKey()));
+            req.setDisplayName(scope.getName());
+            req.setDescription(scope.getDescription());
+
+            scopesToBeUpdated.add(req);
+        }
+
+        for(AsgardeoScopeResponse scope : fetchedScopes) {
+            AsgardeoScopeCreateRequest req = new AsgardeoScopeCreateRequest();
+            req.setName(scope.getName());
+            req.setDisplayName(scope.getDisplayName());
+            req.setDescription(scope.getDescription());
+
+            scopesToBeUpdated.add(req);
+        }
+
+        apiResourceScopesClient.createScope(globalApiResourceId, scopesToBeUpdated);
     }
+
+//    private String addScopePrefix(String scope){
+//        return AsgardeoConstants.SCOPE_PREFIX.concat(scope);
+//    }
+//
+//    private String removeScopePrefix(String scope){
+//        return scope.split(AsgardeoConstants.SCOPE_PREFIX)[1];
+//    }
 
     @Override
     public void detachResourceScopes(API api, Set<URITemplate> uriTemplates) throws APIManagementException {
@@ -631,17 +835,33 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     @Override
     public void deleteScope(String scopeName) throws APIManagementException {
 
+        apiResourceScopesClient.deleteScope(globalApiResourceId, scopeName);
+        scopeNameToIdMap.remove(scopeName);
     }
 
     @Override
     public void updateScope(Scope scope) throws APIManagementException {
-
+//        String scopeId = scopeNameToIdMap.get(scope.getKey());
+//        if (scopeId == null) {
+//            // refresh cache
+//            getAllScopes();
+//            scopeId = scopeNameToIdMap.get(scope.getKey());
+//        }
+//        if (scopeId == null) {
+//            throw new APIManagementException("Scope not found in Asgardeo: " + scope.getKey());
+//        }
+//
+//        AsgardeoScopeUpdateRequest req = new AsgardeoScopeUpdateRequest();
+//        req.setDisplayName(scope.getName());
+//        req.setDescription(scope.getDescription());
+//
+//        apiResourceScopesClient.updateScope(globalApiResourceId, scopeId, req);
     }
 
     @Override
     public boolean isScopeExists(String scopeName) throws APIManagementException {
 
-        return false;
+        return getScopeByName(scopeName) != null;
     }
 
     @Override
@@ -666,5 +886,27 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         }
 
         return encodedCredentials;
+    }
+
+    private String doesAPIResourceExistAndGetId() throws APIManagementException{
+        int limit = 100;
+
+        AsgardeoAPIResourceListResponse page = apiResourceClient.listAPIResources(limit, AsgardeoConstants.GLOBAL_API_RESOURCE_NAME);
+        if(page.getApiResources() != null)
+            for(AsgardeoAPIResourceResponse r : page.getApiResources())
+                if(AsgardeoConstants.GLOBAL_API_RESOURCE_NAME.equals(r.getName()))
+                    return r.getId();
+
+        //if not found, create it
+        AsgardeoAPIResourceCreateRequest req = new AsgardeoAPIResourceCreateRequest();
+        req.setName(AsgardeoConstants.GLOBAL_API_RESOURCE_NAME);
+        req.setIdentifier(AsgardeoConstants.GLOBAL_API_RESOURCE_IDENTIFIER);
+
+        AsgardeoAPIResourceResponse created = apiResourceClient.createAPIResource(req);
+        if (created == null || created.getId() == null) {
+            throw new APIManagementException("Failed to create global API resource in Asgardeo.");
+        }
+
+        return created.getId();
     }
 }
