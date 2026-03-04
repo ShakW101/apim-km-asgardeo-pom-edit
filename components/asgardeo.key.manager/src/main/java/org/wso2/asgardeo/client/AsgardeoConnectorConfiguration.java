@@ -28,7 +28,7 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Connector configuration for WSO2 Identity Server 7.
+ * Connector configuration for Asgardeo.
  */
 @Component(
         name = "custom.configuration.component",
@@ -72,6 +72,12 @@ public class AsgardeoConnectorConfiguration implements KeyManagerConnectorConfig
                 "Client Secret", "input",
                 "Client Secret of the Management Application", "", true, true,
                 Collections.emptyList(), false));
+
+        configurationDtoList.add(new ConfigurationDto(AsgardeoConstants.GLOBAL_API_RESOURCE_NAME,
+                "Global Scopes API Resource Name", "input",
+                "Name of the API Resource in which WSO2 API Manager scopes reside", "", true, false,
+                Collections.emptyList(), false));
+
         configurationDtoList.add(new ConfigurationDto(AsgardeoConstants.RESOURCE_MANAGEMENT_ENDPOINT,
                 "Asgardeo API Resource Management Endpoint", "input",
                 String.format("E.g., %s/api/server/v1/api-resources",

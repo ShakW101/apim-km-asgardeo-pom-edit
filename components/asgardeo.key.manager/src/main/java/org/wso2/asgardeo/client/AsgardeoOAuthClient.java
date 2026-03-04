@@ -30,7 +30,6 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.jetbrains.annotations.NotNull;
 import org.wso2.asgardeo.client.model.AsgardeoAPIResourceClient;
-import org.wso2.asgardeo.client.model.AsgardeoAPIResourceCreateRequest;
 import org.wso2.asgardeo.client.model.AsgardeoAPIResourceListResponse;
 import org.wso2.asgardeo.client.model.AsgardeoAPIResourceResponse;
 import org.wso2.asgardeo.client.model.AsgardeoAPIResourceScopesClient;
@@ -93,7 +92,7 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
     private AsgardeoSCIMRolesClient asgardeoSCIMRolesClient;
 
     private String mgmtClientId, mgmtClientSecret; //client id and secret of management app
-    private String globalApiResourceId;
+    private String globalApiResourceId, globalApiResourceName;
 
     private boolean enableRoleCreation;
 
@@ -149,6 +148,12 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
             apiResourceServerBase = baseURL + "/t/" + org + "/api/server/v1/api-resources";
         }
 
+        if (configuration.getParameter(AsgardeoConstants.GLOBAL_API_RESOURCE_NAME) != null) {
+            globalApiResourceName = (String) configuration.getParameter(AsgardeoConstants.GLOBAL_API_RESOURCE_NAME);
+        } else {
+            globalApiResourceName = AsgardeoConstants.GLOBAL_API_RESOURCE_NAME;
+        }
+
         authClient = feign.Feign.builder()
                 .client(new feign.okhttp.OkHttpClient())
                 .encoder(new FormEncoder())
@@ -198,7 +203,7 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
                 .requestInterceptor(interceptor)
                 .target(AsgardeoSCIMRolesClient.class, rolesEndpoint);
 
-        globalApiResourceId = getAPIResourceId();
+        globalApiResourceId = getAPIResourceId(globalApiResourceName);
     }
 
     @Override
@@ -797,7 +802,7 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
 
         if (globalApiResourceId == null) {
             try {
-                globalApiResourceId = getAPIResourceId();
+                globalApiResourceId = getAPIResourceId(globalApiResourceName);
             } catch (APIManagementException e) {
                 log.error("Couldn't find global resource", e);
                 return;
@@ -834,7 +839,7 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
 
         try {
             if (globalApiResourceId == null) {
-                globalApiResourceId = getAPIResourceId();
+                globalApiResourceId = getAPIResourceId(globalApiResourceName);
             }
 
             if (globalApiResourceId != null) {
@@ -873,16 +878,15 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
         return AsgardeoConstants.ASGARDEO_TYPE;
     }
 
-    private String getAPIResourceId() throws APIManagementException {
-
-        int limit = 100;
+    private String getAPIResourceId(String globalApiResourceName) throws APIManagementException {
 
         try {
             AsgardeoAPIResourceListResponse page = apiResourceClient
-                    .listAPIResources(limit, AsgardeoConstants.GLOBAL_API_RESOURCE_NAME);
+                    .listAPIResources(globalApiResourceName);
             if (page.getApiResources() != null) {
                 for (AsgardeoAPIResourceResponse r : page.getApiResources()) {
-                    if (AsgardeoConstants.GLOBAL_API_RESOURCE_NAME.equals(r.getName())) {
+                    if (globalApiResourceName.equals(r.getName())) {
+                        log.info("Asgardeo Global API Resource discovered successfully");
                         return r.getId();
                     }
                 }
@@ -891,22 +895,10 @@ public class AsgardeoOAuthClient extends AbstractKeyManager {
             handleException("Failed to fetch API Resources from Asgardeo", e);
         }
 
-        //if not found, create it
-        AsgardeoAPIResourceCreateRequest req = new AsgardeoAPIResourceCreateRequest();
-        req.setName(AsgardeoConstants.GLOBAL_API_RESOURCE_NAME);
-        req.setIdentifier(AsgardeoConstants.GLOBAL_API_RESOURCE_IDENTIFIER);
+        globalApiResourceId = null;
 
-        AsgardeoAPIResourceResponse created;
-        try {
-            created = apiResourceClient.createAPIResource(req);
-            if (created == null || created.getId() == null) {
-                throw new APIManagementException("Failed to create global API resource in Asgardeo.");
-            }
-            return created.getId();
-        } catch (FeignException e) {
-            handleException("Failed to create global API Resource on Asgardeo", e);
-        }
-        return null;
+        throw new APIManagementException("Failed to locate global API Resource on Asgardeo");
+
     }
 
     /**

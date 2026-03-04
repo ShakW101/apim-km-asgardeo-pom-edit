@@ -47,7 +47,6 @@ public class AsgardeoConstants {
     public static final String TOKEN_STATE_INACTIVE = "INACTIVE";
 
     public static final String GLOBAL_API_RESOURCE_NAME = "APIM_GLOBAL_SCOPES";
-    public static final String GLOBAL_API_RESOURCE_IDENTIFIER = "/api/server/v1/scope-resource";
 
     public static final String APPLICATION_TOKEN_LIFETIME = "ext_application_token_lifetime";
     public static final String USER_TOKEN_LIFETIME = "ext_user_token_lifetime";
